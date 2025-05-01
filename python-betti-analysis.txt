@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""
+Betti Number Analysis for Cosmic Web Topology
+---------------------------------------------
+This script performs persistent homology analysis on cosmic web data
+to compute Betti numbers and persistence diagrams.
+"""
+
+import argparse
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import gudhi as gd
+from gudhi.point_cloud.complex import RipsComplex
+from gudhi.persistence_graphical_tools import plot_persistence_diagram
+import os
+import json
+from tqdm import tqdm
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+def load_filament_data(filepath):
+    """
+    Load filament data from CSV file.
+    
+    Parameters:
+    -----------
+    filepath : str
+        Path to the CSV file containing filament data
+        
+    Returns:
+    --------
+    nodes : numpy.ndarray
+        Array of node coordinates (N x 3)
+    edges : numpy.ndarray
+        Array of edge connections (M x 2)
+    """
+    logger.info(f"Loading filament data from {filepath}")
+    df = pd.read_csv(filepath)
+    
+    # Extract unique nodes
+    nodes = []
+    node_indices = {}
+    
+    # Process first endpoint of each filament
+    for i, row in enumerate(df.itertuples()):
+        p1 = (row.node1_x, row.node1_y, row.node1_z)
+        if p1 not in node_indices:
+            node_indices[p1] = len(nodes)
+            nodes.append(p1)
+            
+        # Process second endpoint
+        p2 = (row.node2_x, row.node2_y, row.node2_z)
+        if p2 not in node_indices:
+            node_indices[p2] = len(nodes)
+            nodes.append(p2)
+    
+    # Create edges
+    edges = []
+    for i, row in enumerate(df.itertuples()):
+        p1 = (row.node1_x, row.node1_y, row.node1_z)
+        p2 = (row.node2_x, row.node2_y, row.node2_z)
+        edges.append((node_indices[p1], node_indices[p2]))
+    
+    logger.info(f"Extracted {len(nodes)} nodes and {len(edges)} edges")
+    return np.array(nodes), np.array(edges)
+
+def calculate_betti_numbers(point_cloud, max_dimension=2, max_edge_length=5.0):
+    """
+    Calculate persistent homology and Betti numbers using GUDHI.
+    
+    Parameters:
+    -----------
+    point_cloud : numpy.ndarray
+        Array of points in 3D space
+    max_dimension : int
+        Maximum homology dimension to compute
+    max_edge_length : float
+        Maximum edge length for the Vietoris-Rips complex
+        
+    Returns:
+    --------
+    dict
+        Dictionary containing Betti numbers and persistence diagrams
+    """
+    logger.info(f"Computing persistent homology (max dim={max_dimension}, max edge={max_edge_length})")
+    
+    # Create Vietoris-Rips complex
+    rips_complex = RipsComplex(
+        points=point_cloud,
+        max_edge_length=max_edge_length
+    )
+    
+    # Create simplex tree
+    simplex_tree = rips_complex.create_simplex_tree(max_dimension=max_dimension)
+    logger.info(f"Created simplex tree with {simplex_tree.num_simplices()} simplices")
+    
+    # Compute persistent homology
+    simplex_tree.compute_persistence()
+    
+    # Extract Betti numbers for different filtration values
+    filtration_values = np.linspace(0, max_edge_length, 50)
+    betti_evolution = []
+    
+    for eps in tqdm(filtration_values):
+        betti_numbers = simplex_tree.persistent_betti_numbers(0, eps)
+        betti_evolution.append({
+            'filtration_value': float(eps),
+            'betti_0': int(betti_numbers[0]) if len(betti_numbers) > 0 else 0,
+            'betti_1': int(betti_numbers[1]) if len(betti_numbers) > 1 else 0,
+            'betti_2': int(betti_numbers[2]) if len(betti_numbers) > 2 else 0
+        })
+    
+    # Get persistence diagrams for each dimension
+    persistence_diagrams = []
+    for i in range(max_dimension + 1):
+        diagram = simplex_tree.persistence_intervals_in_dimension(i)
+        persistence_diagrams.append(diagram.tolist())
+    
+    logger.info("Persistent homology computation complete")
+    
+    return {
+        'betti_evolution': betti_evolution,
+        'persistence_diagrams': persistence_diagrams
+    }
+
+def generate_persistence_diagram(persistence_data, output_dir, name_prefix):
+    """
+    Generate and save persistence diagrams as figures.
+    
+    Parameters:
+    -----------
+    persistence_data : dict
+        Dictionary containing persistence diagrams
+    output_dir : str
+        Directory to save the figures
+    name_prefix : str
+        Prefix for the figure filenames
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Create figure for combined persistence diagram
+    plt.figure(figsize=(12, 8))
+    
+    colors = ['blue', 'red', 'green']
+    labels = ['H₀ (Components)', 'H₁ (Cycles)', 'H₂ (Voids)']
+    
+    for i, diag in enumerate(persistence_data['persistence_diagrams']):
+        if i > 2:  # Only plot up to dimension 2
+            break
+            
+        # Convert diagram to numpy array
+        diagram = np.array(diag)
+        if len(diagram) == 0:
+            continue
+            
+        # Plot points
+        plt.scatter(
+            diagram[:, 0], diagram[:, 1],
+            label=labels[i],
+            color=colors[i],
+            alpha=0.7
+        )
+    
+    # Add diagonal line
+    max_val = plt.gca().get_xlim()[1]
+    plt.plot([0, max_val], [0, max_val], 'k--', alpha=0.3)
+    
+    plt.grid(True, alpha=0.3)
+    plt.xlabel('Birth', fontsize=14)
+    plt.ylabel('Death', fontsize=14)
+    plt.title('Persistence Diagram of Cosmic Web', fontsize=16)
+    plt.legend(fontsize=12)
+    plt.tight_layout()
+    
+    # Save figure
+    plt.savefig(os.path.join(output_dir, f"{name_prefix}_persistence_diagram.png"), dpi=300)
+    logger.info(f"Saved persistence diagram to {output_dir}/{name_prefix}_persistence_diagram.png")
+    
+    # Generate Betti evolution plot
+    betti_evol = persistence_data['betti_evolution']
+    
+    plt.figure(figsize=(12, 8))
+    
+    filtration_values = [item['filtration_value'] for item in betti_evol]
+    betti0_values = [item['betti_0'] for item in betti_evol]
+    betti1_values = [item['betti_1'] for item in betti_evol]
+    betti2_values = [item['betti_2'] for item in betti_evol]
+    
+    plt.plot(filtration_values, betti0_values, 'b-', label='β₀ (Components)', linewidth=2)
+    plt.plot(filtration_values, betti1_values, 'r-', label='β₁ (Cycles)', linewidth=2)
+    plt.plot(filtration_values, betti2_values, 'g-', label='β₂ (Voids)', linewidth=2)
+    
+    plt.grid(True, alpha=0.3)
+    plt.xlabel('Filtration Value (Mpc)', fontsize=14)
+    plt.ylabel('Betti Number', fontsize=14)
+    plt.title('Evolution of Betti Numbers with Filtration Value', fontsize=16)
+    plt.legend(fontsize=12)
+    plt.tight_layout()
+    
+    # Save figure
+    plt.savefig(os.path.join(output_dir, f"{name_prefix}_betti_evolution.png"), dpi=300)
+    logger.info(f"Saved Betti evolution plot to {output_dir}/{name_prefix}_betti_evolution.png")
+
+def main():
+    parser = argparse.ArgumentParser(description='Compute persistent homology for cosmic web data')
+    parser.add_argument('--input', required=True, help='Path to the filament data CSV file')
+    parser.add_argument('--output', required=True, help='Output directory for results')
+    parser.add_argument('--max_dimension', type=int, default=2, help='Maximum homology dimension to compute')
+    parser.add_argument('--max_edge_length', type=float, default=10.0, help='Maximum edge length for filtration')
+    
+    args = parser.parse_args()
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(args.output, exist_ok=True)
+    
+    # Load data
+    try:
+        nodes, edges = load_filament_data(args.input)
+    except Exception as e:
+        logger.error(f"Error loading data: {e}")
+        return 1
+    
+    # Compute persistent homology
+    try:
+        results = calculate_betti_numbers(
+            nodes,
+            max_dimension=args.max_dimension,
+            max_edge_length=args.max_edge_length
+        )
+    except Exception as e:
+        logger.error(f"Error in persistent homology computation: {e}")
+        return 1
+    
+    # Save results to JSON
+    name_prefix = os.path.splitext(os.path.basename(args.input))[0]
+    output_json = os.path.join(args.output, f"{name_prefix}_betti_results.json")
+    with open(output_json, 'w') as f:
+        json.dump(results, f, indent=2)
+    logger.info(f"Saved results to {output_json}")
+    
+    # Generate figures
+    try:
+        generate_persistence_diagram(results, args.output, name_prefix)
+    except Exception as e:
+        logger.error(f"Error generating diagrams: {e}")
+        return 1
+    
+    logger.info("Analysis complete!")
+    return 0
+
+if __name__ == '__main__':
+    exit(main())

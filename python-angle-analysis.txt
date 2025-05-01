@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""
+Angle Distribution Analysis for Cosmic Web
+-----------------------------------------
+This script analyzes the angles between filaments at intersection points
+in the cosmic web structure and compares them with theoretical predictions.
+"""
+
+import argparse
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+from scipy.stats import ks_2samp, chisquare
+import os
+import json
+from collections import defaultdict
+import logging
+from tqdm import tqdm
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+def load_node_data(filepath):
+    """
+    Load node and connected filament data.
+    
+    Parameters:
+    -----------
+    filepath : str
+        Path to the node data CSV file
+        
+    Returns:
+    --------
+    pandas.DataFrame
+        DataFrame containing node information
+    """
+    logger.info(f"Loading node data from {filepath}")
+    try:
+        df = pd.read_csv(filepath)
+        logger.info(f"Loaded {len(df)} nodes")
+        return df
+    except Exception as e:
+        logger.error(f"Error loading node data: {e}")
+        raise
+
+def load_filament_data(filepath):
+    """
+    Load filament segment data.
+    
+    Parameters:
+    -----------
+    filepath : str
+        Path to the filament data CSV file
+        
+    Returns:
+    --------
+    pandas.DataFrame
+        DataFrame containing filament information
+    """
+    logger.info(f"Loading filament data from {filepath}")
+    try:
+        df = pd.read_csv(filepath)
+        logger.info(f"Loaded {len(df)} filament segments")
+        return df
+    except Exception as e:
+        logger.error(f"Error loading filament data: {e}")
+        raise
+
+def compute_angles(nodes_df, filaments_df):
+    """
+    Compute angles between filaments at junction points.
+    
+    Parameters:
+    -----------
+    nodes_df : pandas.DataFrame
+        DataFrame containing node information
+    filaments_df : pandas.DataFrame
+        DataFrame containing filament information
+        
+    Returns:
+    --------
+    dict
+        Dictionary mapping node IDs to lists of angles
+    """
+    logger.info("Computing angles at junction points")
+    
+    # Create a mapping from node coordinates to filament segments
+    node_to_filaments = defaultdict(list)
+    
+    # Process each filament
+    for _, row in tqdm(filaments_df.iterrows(), total=len(filaments_df)):
+        # First endpoint
+        node1 = (row['node1_x'], row['node1_y'], row['node1_z'])
+        # Vector from node1 to node2
+        direction = np.array([
+            row['node2_x'] - row['node1_x'],
+            row['node2_y'] - row['node1_y'],
+            row['node2_z'] - row['node1_z']
+        ])
+        direction = direction / np.linalg.norm(direction)
+        node_to_filaments[node1].append(direction)
+        
+        # Second endpoint
+        node2 = (row['node2_x'], row['node2_y'], row['node2_z'])
+        # Vector from node2 to node1 (opposite direction)
+        direction = -direction
+        node_to_filaments[node2].append(direction)
+    
+    # Compute angles at each junction point (nodes with multiple filaments)
+    node_angles = {}
+    
+    for node, directions in tqdm(node_to_filaments.items()):
+        if len(directions) >= 2:  # Only nodes with at least 2 filaments
+            angles = []
+            for i in range(len(directions)):
+                for j in range(i+1, len(directions)):
+                    # Compute angle between two directions in degrees
+                    cos_angle = np.clip(np.dot(directions[i], directions[j]), -1.0, 1.0)
+                    angle = np.arccos(cos_angle) * 180 / np.pi
+                    angles.append(angle)
+            
+            if angles:
+                node_angles[node] = angles
+    
+    logger.info(f"Computed angles for {len(node_angles)} junction points")
+    return node_angles
+
+def analyze_angle_distribution(angles_dict):
+    """
+    Analyze the distribution of angles.
+    
+    Parameters:
+    -----------
+    angles_dict : dict
+        Dictionary mapping node IDs to lists of angles
+        
+    Returns:
+    --------
+    dict
+        Dictionary containing angle analysis results
+    """
+    # Flatten all angles into a single list
+    all_angles = []
+    for node, angles in angles_dict.items():
+        all_angles.extend(angles)
+    
+    # Basic statistics
+    angle_array = np.array(all_angles)
+    mean_angle = np.mean(angle_array)
+    median_angle = np.median(angle_array)
+    std_angle = np.std(angle_array)
+    
+    # Bin the angles
+    hist, bin_edges = np.histogram(angle_array, bins=36, range=(0, 180))
+    
+    # Calculate bin centers
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    
+    # Generate theoretical distributions
+    uniform_dist = np.ones_like(hist) * len(angle_array) / 36  # Uniform distribution
+    
+    # Gaussian distribution centered at 90° (orthogonal preference)
+    orthogonal_dist = len(angle_array) * 3 * np.exp(-0.5 * ((bin_centers - 90) / 15)**2) / (36 * 3)
+    
+    # Statistical tests
+    chi2_unif, p_unif = chisquare(hist, f_exp=uniform_dist)
+    chi2_orth, p_orth = chisquare(hist, f_exp=orthogonal_dist)
+    
+    # Package results
+    results = {
+        'total_angles': len(all_angles),
+        'mean_angle': float(mean_angle),
+        'median_angle': float(median_angle),
+        'std_angle': float(std_angle),
+        'histogram': hist.tolist(),
+        'bin_edges': bin_edges.tolist(),
+        'chi2_tests': {
+            'uniform': {'chi2': float(chi2_unif), 'p_value': float(p_unif)},
+            'orthogonal': {'chi2': float(chi2_orth), 'p_value': float(p_orth)}
+        }
+    }
+    
+    logger.info(f"Angle analysis complete: mean={mean_angle:.2f}°, median={median_angle:.2f}°")
+    return results
+
+def compare_with_theoretical(observed_angles, model_name, output_dir):
+    """
+    Compare observed angle distribution with theoretical model.
+    
+    Parameters:
+    -----------
+    observed_angles : list
+        List of observed angles
+    model_name : str
+        Name of theoretical model to use ('uniform', 'lcdm', or 'membrane')
+    output_dir : str
+        Directory to save the output
+        
+    Returns:
+    --------
+    dict
+        Dictionary containing comparison results
+    """
+    logger.info(f"Comparing with {model_name} model")
+    
+    np.random.seed(42)  # For reproducibility
+    
+    # Generate theoretical angles based on model
+    if model_name == 'uniform':
+        # Uniform random distribution
+        theoretical_angles = np.random.uniform(0, 180, len(observed_angles))
+    
+    elif model_name == 'lcdm':
+        # ΛCDM tends toward slightly more uniform distribution
+        # with some clustering due to gravitational effects
+        theoretical_angles = []
+        for _ in range(len(observed_angles)):
+            # 70% uniform, 30% with slight clustering
+            if np.random.random() < 0.7:
+                angle = np.random.uniform(0, 180)
+            else:
+                # Some clustering around 45° and 135°
+                center = 45 if np.random.random() < 0.5 else 135
+                angle = center + np.random.normal(0, 20)
+                angle = np.clip(angle, 0, 180)
+            theoretical_angles.append(angle)
+        theoretical_angles = np.array(theoretical_angles)
+    
+    elif model_name == 'membrane':
+        # Membrane model has strong preference for 90° (orthogonal) and 120° (triple junctions)
+        theoretical_angles = []
+        for _ in range(len(observed_angles)):
+            r = np.random.random()
+            if r < 0.6:
+                # 60% around 90° (orthogonal junctions)
+                angle = 90 + np.random.normal(0, 12)
+            elif r < 0.85:
+                # 25% around 120° (triple junctions)
+                angle = 120 + np.random.normal(0, 10)
+            else:
+                # 15% random
+                angle = np.random.uniform(0, 180)
+            angle = np.clip(angle, 0, 180)
+            theoretical_angles.append(angle)
+        theoretical_angles = np.array(theoretical_angles)
+    
+    else:
+        raise ValueError(f"Unknown model: {model_name}")
+    
+    # Statistical comparison
+    ks_stat, ks_pvalue = ks_2samp(observed_angles, theoretical_angles)
+    
+    # Bin both distributions
+    obs_hist, bin_edges = np.histogram(observed_angles, bins=36, range=(0, 180))
+    theo_hist, _ = np.histogram(theoretical_angles, bins=36, range=(0, 180))
+    
+    # Chi-square test
+    chi2, p = chisquare(obs_hist, f_exp=theo_hist)
+    
+    # Save to file
+    comparison_data = {
+        'observed': {
+            'angles': observed_angles,
+            'histogram': obs_hist.tolist(),
+        },
+        'theoretical': {
+            'model': model_name,
+            'angles': theoretical_angles.tolist(),
+            'histogram': theo_hist.tolist(),
+        },
+        'bin_edges': bin_edges.tolist(),
+        'statistics': {
+            'ks_statistic': float(ks_stat),
+            'ks_pvalue': float(ks_pvalue),
+            'chi2': float(chi2),
+            'chi2_pvalue': float(p)
+        }
+    }
+    
+    # Save comparison data
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, f"angle_comparison_{model_name}.json"), 'w') as f:
+        json.dump(comparison_data, f, indent=2)
+    
+    # Generate comparison plot
+    plt.figure(figsize=(12, 8))
+    
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    
+    plt.bar(bin_centers, obs_hist, width=5, alpha=0.5, label='Observed', color='blue')
+    plt.plot(bin_centers, theo_hist, 'r-', linewidth=2, label=f'{model_name.capitalize()} Model')
+    
+    plt.xlabel('Angle (degrees)', fontsize=14)
+    plt.ylabel('Frequency', fontsize=14)
+    plt.title(f'Angle Distribution: Observed vs {model_name.capitalize()} Model', fontsize=16)
+    plt.grid(True, alpha=0.3)
+    plt.xlim(0, 180)
+    plt.legend(fontsize=12)
+    
+    # Add statistical test results
+    plt.text(0.05, 0.95, f"KS test: p={ks_pvalue:.4f}\nχ² test: p={p:.4f}",
+             transform=plt.gca().transAxes, fontsize=12,
+             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.5))
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"angle_comparison_{model_name}.png"), dpi=300)
+    
+    logger.info(f"Comparison with {model_name} model: KS p-value = {ks_pvalue:.4f}, Chi² p-value = {p:.4f}")
+    
+    return comparison_data
+
+def create_combined_comparison_plot(comparisons, output_dir):
+    """
+    Create a combined plot comparing observed angles with all theoretical models.
+    
+    Parameters:
+    -----------
+    comparisons : dict
+        Dictionary of comparison results for different models
+    output_dir : str
+        Directory to save the output
+    """
+    plt.figure(figsize
